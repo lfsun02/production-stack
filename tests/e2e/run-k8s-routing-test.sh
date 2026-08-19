@@ -94,7 +94,8 @@ deploy_helm_chart() {
 wait_for_pods() {
     print_status "⏳ Waiting for pods to be ready"
     chmod +x tests/e2e/wait-for-pods.sh
-    tests/e2e/wait-for-pods.sh --pod-prefix vllm --timeout 300 --verbose
+    # A warm boot alone takes ~3.5m, so 300s left no room for a cold image pull.
+    tests/e2e/wait-for-pods.sh --pod-prefix vllm --timeout 600 --verbose
 }
 
 # Function to setup port forwarding
@@ -204,6 +205,30 @@ collect_debug_logs() {
     kubectl get events --sort-by='.lastTimestamp' > "$RESULT_DIR/debug-logs/test-type-$test_type/events.txt" 2>/dev/null || true
 }
 
+# Function to wait for the release's PVCs to be deleted.
+# Tracked by name: the chart leaves PVCs unlabeled unless pvcLabels is set.
+wait_for_pvcs_deleted() {
+    local timeout=$1
+    local start=$SECONDS
+    local remaining
+
+    while true; do
+        remaining=$(kubectl get pvc --no-headers 2>/dev/null | awk '{print $1}' | grep "^vllm-" || true)
+        if [ -z "$remaining" ]; then
+            print_status "All vllm PVCs released"
+            return 0
+        fi
+
+        if [ $((SECONDS - start)) -ge "$timeout" ]; then
+            print_warning "Timeout waiting for PVCs to be released after ${timeout}s. Still present:"
+            kubectl get pvc 2>/dev/null || true
+            return 1
+        fi
+
+        sleep 5
+    done
+}
+
 # Function to cleanup resources
 cleanup_resources() {
     print_status "🧹 Cleaning up resources"
@@ -211,8 +236,15 @@ cleanup_resources() {
     # Kill any port forwarding processes
     pkill -f "kubectl port-forward" 2>/dev/null || true
 
-    # Uninstall helm chart
-    helm uninstall vllm 2>/dev/null || true
+    # Without --wait the next install races this teardown and its pods hang
+    # Pending on the half-deleted PVC.
+    if helm status vllm >/dev/null 2>&1; then
+        helm uninstall vllm --wait --timeout 2m 2>/dev/null || true
+    fi
+
+    # helm --wait does not cover PVCs, which the pvc-protection finalizer holds.
+    kubectl wait --for=delete pod -l app.kubernetes.io/instance=vllm --timeout=120s >/dev/null 2>&1 || true
+    wait_for_pvcs_deleted 120 || true
 
     # Clean up docker images
     sudo docker image prune -f 2>/dev/null || true
@@ -228,15 +260,25 @@ run_complete_test() {
     print_status "Starting $test_type test"
     print_status "=========================================="
 
-    # Deploy helm chart
-    deploy_helm_chart "$helm_values_file"
+    # "all" mode calls this from an `if`, so errexit is off here: check every step.
+    if ! deploy_helm_chart "$helm_values_file"; then
+        print_error "❌ Helm deployment failed for $test_type (infrastructure, not routing)"
+        collect_debug_logs "$test_type"
+        cleanup_resources
+        return 1
+    fi
 
-    # Wait for pods
-    wait_for_pods
+    if ! wait_for_pods; then
+        print_error "❌ Pods never became ready for $test_type (infrastructure, not routing)"
+        collect_debug_logs "$test_type"
+        cleanup_resources
+        return 1
+    fi
 
     # Setup port forwarding for k8s discovery
     if ! setup_port_forwarding; then
         print_error "Failed to setup port forwarding"
+        collect_debug_logs "$test_type"
         cleanup_resources
         return 1
     fi
