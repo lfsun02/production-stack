@@ -76,7 +76,7 @@ async def _consume(request, body, background_tasks=None):
     gen = process_request(
         request, body, URL, "req-1", "/v1/chat/completions", background_tasks
     )
-    await gen.__anext__()  # headers and status
+    await anext(gen)  # headers and status
     async for chunk in gen:
         received.append(chunk)
     return b"".join(received)
@@ -97,7 +97,7 @@ async def test_streamed_body_is_not_retained_without_post_request_callback(monit
     tracemalloc.start()
     try:
         gen = process_request(request, body, URL, "req-1", "/v1/chat/completions", None)
-        await gen.__anext__()
+        await anext(gen)
         async for _ in gen:
             pass  # a client that forwards and forgets each chunk
         _, peak = tracemalloc.get_traced_memory()
